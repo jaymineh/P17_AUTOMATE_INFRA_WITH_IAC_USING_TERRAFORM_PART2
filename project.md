@@ -61,6 +61,67 @@ resource "aws_subnet" "public" {
 }
 ```
 
+- Create a new file called `variable.tf` and insert the following variables inside:
+
+```
+variable "region" {
+      default = "us-east-1"
+}
+
+variable "vpc_cidr" {
+    default = "10.0.0.0/16"
+}
+
+variable "enable_dns_support" {
+    default = "true"
+}
+
+variable "enable_dns_hostnames" {
+    default ="true" 
+}
+
+variable "preferred_number_of_public_subnets" {
+    default = null
+}
+
+variable "preferred_number_of_private_subnets" {
+  type        = number
+  description = "Number of private subnets"
+}
+
+variable "name" {
+  type    = string
+  default = "ACS"
+}
+
+variable "tags" {
+  type        = map(string)
+  description = "A mapping of tags to assign to all resources"
+  default     = {}
+}
+```
+
+- Create `terraform.tfvars` and insert the following code:
+
+```
+region = "us-east-1"
+
+vpc_cidr = "10.0.0.0/16" 
+
+enable_dns_support = "true" 
+
+enable_dns_hostnames = "true"  
+
+preferred_number_of_public_subnets = 2
+
+preferred_number_of_private_subnets = 4
+
+tags = {
+  Owner-Email = "jemine@iceglobalv.onmicrosoft.com"
+  Managed-By  = "Terraform"
+}
+```
+
 **Step 2 - Create Internet Gateway**
 ---
 
@@ -111,6 +172,21 @@ resource "aws_nat_gateway" "nat" {
     },
   )
 }
+```
+
+- Insert the code below into the `variables.tf` file:
+
+```
+variable "environment" {
+  type        = string
+  description = "Environment"
+}
+```
+
+- Insert the following into the `terraform.tfvars` files:
+
+```
+environment = "DEV"
 ```
 
 **Step 4 - Creating Routes**
@@ -459,114 +535,6 @@ resource "aws_security_group_rule" "inbound-mysql-webserver" {
 ```
 
 *The `aws_security_group_rule` is used to reference another security group*
-
-**Step 7 - Setup Variables**
----
-
-*Since we have been using several variables in the previous steps, we would need to declare these variables in a file that Terraform will read from.*
-
-- Create new file called `variables.tf`. Paste in the code below:
-
-```
-variable "region" {
-      default = "us-east-1"
-}
-
-variable "vpc_cidr" {
-    default = "10.0.0.0/16"
-}
-
-variable "enable_dns_support" {
-    default = "true"
-}
-
-variable "enable_dns_hostnames" {
-    default ="true" 
-}
-
-  variable "preferred_number_of_public_subnets" {
-      default = null
-}
-
-variable "preferred_number_of_private_subnets" {
-  type        = number
-  description = "Number of private subnets"
-}
-
-variable "name" {
-  type    = string
-  default = "ACS"
-}
-
-variable "tags" {
-  type        = map(string)
-  description = "A mapping of tags to assign to all resources"
-  default     = {}
-}
-
-variable "environment" {
-  type        = string
-  description = "Environment"
-}
-
-variable "ami" {
-  type        = string
-  description = "AMI ID for the launch template"
-}
-
-variable "keypair" {
-  type        = string
-  description = "Key pair for the instances"
-}
-
-variable "account_no" {
-  type        = number
-  description = "the account number"
-}
-
-variable "master-username" {
-  type        = string
-  description = "RDS admin username"
-}
-
-variable "master-password" {
-  type        = string
-  description = "RDS master password"
-}
-```
-
-- Create another file called `terraform.tfvars` that would assign values to the variables and paste in the code below:
-
-```
-region = "us-east-1"
-
-vpc_cidr = "10.0.0.0/16" 
-
-enable_dns_support = "true" 
-
-enable_dns_hostnames = "true"  
-
-preferred_number_of_public_subnets = 2
-
-preferred_number_of_private_subnets = 4
-
-tags = {
-  Owner-Email = "jemine@iceglobalv.onmicrosoft.com"
-  Managed-By  = "Terraform"
-}
-
-environment = "DEV"
-
-ami = "ami-026ebd4cfe2c043b2"
-
-keypair = "Jemine-EC4"
-
-account_no = 894194274688
-
-master-username = "admin"
-
-master-password = "password"
-```
 
 **Step 7 - Create Certificate From Amazon Certificate Manager**
 ---
@@ -980,6 +948,28 @@ resource "aws_autoscaling_attachment" "asg_attachment_nginx" {
 }
 ```
 
+- Update the `variables.tf` file with the following code:
+
+```
+variable "ami" {
+  type        = string
+  description = "AMI ID for the launch template"
+}
+
+variable "keypair" {
+  type        = string
+  description = "Key pair for the instances"
+}
+```
+
+- Update the `terraform.tfvars` with the following code:
+
+```
+ami = "ami-026ebd4cfe2c043b2"
+
+keypair = "<keypair_name>"
+```
+
 - Create `asg-wordpress-tooling.tf` and enter the following codes which would create launch templates and auto scaling groups for both the wordpress and tooling webserver.
 
 ```
@@ -1209,3 +1199,207 @@ systemctl restart httpd
 
 *In the sudo mount line, $1 & $2 are used as placeholders for the EFS mount points and access points. The values will be gotten when the `provisioner` line in `asg-wordpress-nginx.tf` runs and the placeholder will be replaced with the generated values*
 
+**Step 10 - Create Database And EFS Resources**
+---
+
+- Create a new file called `efs.tf`. Enter the following code to create KMS key to encrypt EFS resource:
+
+```
+# create key from key management system
+resource "aws_kms_key" "ACS-kms" {
+  description = "KMS key "
+  policy      = <<EOF
+  {
+  "Version": "2012-10-17",
+  "Id": "kms-key-policy",
+  "Statement": [
+    {
+      "Sid": "Enable IAM User Permissions",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::${var.account_no}:user/OfficeLaptop" },
+      "Action": "kms:*",
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+}
+```
+
+- Add the following to the file to create the EFS & access point and then mount to the right subnet:
+
+```
+# create key alias
+resource "aws_kms_alias" "alias" {
+  name          = "alias/kms"
+  target_key_id = aws_kms_key.ACS-kms.key_id
+}
+
+# create Elastic file system
+resource "aws_efs_file_system" "ACS-efs" {
+  encrypted  = true
+  kms_key_id = aws_kms_key.ACS-kms.arn
+
+  tags = {
+    Name = "ACS-efs"
+  }
+}
+
+
+# set first mount target for the EFS 
+resource "aws_efs_mount_target" "subnet-1" {
+  file_system_id  = aws_efs_file_system.ACS-efs.id
+  subnet_id       = aws_subnet.private[2].id
+  security_groups = [aws_security_group.datalayer-sg.id]
+}
+
+
+# set second mount target for the EFS 
+resource "aws_efs_mount_target" "subnet-2" {
+  file_system_id  = aws_efs_file_system.ACS-efs.id
+  subnet_id       = aws_subnet.private[3].id
+  security_groups = [aws_security_group.datalayer-sg.id]
+}
+
+
+# create access point for wordpress
+resource "aws_efs_access_point" "wordpress" {
+  file_system_id = aws_efs_file_system.ACS-efs.id
+
+  posix_user {
+    gid = 0
+    uid = 0
+  }
+
+  root_directory {
+    path = "/wordpress"
+
+    creation_info {
+      owner_gid   = 0
+      owner_uid   = 0
+      permissions = 0755
+    }
+
+  }
+
+}
+
+# create access point for tooling
+resource "aws_efs_access_point" "tooling" {
+  file_system_id = aws_efs_file_system.ACS-efs.id
+  posix_user {
+    gid = 0
+    uid = 0
+  }
+
+  root_directory {
+
+    path = "/tooling"
+
+    creation_info {
+      owner_gid   = 0
+      owner_uid   = 0
+      permissions = 0755
+    }
+
+  }
+}
+```
+
+- Insert the code below into the `variables.tf` file:
+
+```
+variable "account_no" {
+  type        = number
+  description = "the account number"
+}
+```
+
+- Insert the following code into the `terraform.tfvars` file:
+
+```
+account_no = <account_number>
+```
+
+- Add the following command to output the access point ID:
+
+```
+# Output the access point IDs
+output "access_point_id_wordpress" {
+  value = aws_efs_access_point.wordpress.id
+}
+
+output "access_point_id_tooling" {
+  value = aws_efs_access_point.tooling.id
+}
+```
+
+- Create a new file called `rds.tf` and insert the following code which creates the MySQL relational database system.
+
+```
+# create DB subnet group from the private subnets
+resource "aws_db_subnet_group" "ACS-rds" {
+  name       = "acs-rds"
+  subnet_ids = [aws_subnet.private[2].id, aws_subnet.private[3].id]
+
+  tags = {
+    Name = "AWS-RDS"
+  }
+}
+
+# create the RDS instance with the subnets group
+resource "aws_db_instance" "ACS-rds" {
+  allocated_storage      = 20
+  storage_type           = "gp2"
+  engine                 = "mysql"
+  engine_version         = "5.7"
+  instance_class         = "db.t2.micro"
+  db_name                = "jmndb"
+  username               = var.master-username
+  password               = var.master-password
+  parameter_group_name   = "default.mysql5.7"
+  db_subnet_group_name   = aws_db_subnet_group.ACS-rds.name
+  skip_final_snapshot    = true
+  vpc_security_group_ids = [aws_security_group.datalayer-sg.id]
+  multi_az               = "true"
+}
+```
+
+- Update the `variables.tf` file with the code below:
+
+```
+variable "master-username" {
+  type        = string
+  description = "RDS admin username"
+}
+
+variable "master-password" {
+  type        = string
+  description = "RDS master password"
+}
+```
+
+- Update the `terraform.tfvars` file with the code below:
+
+```
+master-username = "admin"
+
+master-password = "password"
+```
+
+**Step 12 - Build**
+---
+
+- Execute `terraform apply`. If the configuration was properly set up, you should see a minimun of 76 items to be built. See screenshot below
+
+![Terraform Plan](images/terraformplan.png)
+
+- After the plan has been seen, execute `terraform apply` for the build to initiate. Ensure the build runs successfully without any errors.
+
+![Terraform Apply](images/terraformapply.png)
+
+- Destroy build when deployment has been completed to prevent further costs.
+
+![Terraform Destroy](images/terraformdestroy.png)
+
+**Project Deployed Successfully!**
