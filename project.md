@@ -645,3 +645,567 @@ resource "aws_route53_record" "wordpress" {
 }
 ```
 
+**Step 8 - Create App Load Balancer**
+---
+
+- Create a file called `alb.tf`. The code below would create an external facing load balanncer which balances traffic for the nginx servers.
+
+```
+# ----------------------------
+#External Load balancer for reverse proxy nginx
+#---------------------------------
+
+resource "aws_lb" "ext-alb" {
+  name            = "ext-alb"
+  internal        = false
+  security_groups = [aws_security_group.ext-alb-sg.id]
+  subnets         = [aws_subnet.public[0].id, aws_subnet.public[1].id]
+
+  tags = {
+    Name = "ext-alb"
+  }
+
+  ip_address_type    = "ipv4"
+  load_balancer_type = "application"
+}
+```
+
+- Create a target group for the nginx server, which informs the ALB where to route traffic.
+
+```
+#--- create a target group for the external load balancer
+resource "aws_lb_target_group" "nginx-tgt" {
+  health_check {
+    interval            = 10
+    path                = "/healthstatus"
+    protocol            = "HTTPS"
+    timeout             = 5
+    healthy_threshold   = 5
+    unhealthy_threshold = 2
+  }
+  name        = "nginx-tgt"
+  port        = 443
+  protocol    = "HTTPS"
+  target_type = "instance"
+  vpc_id      = aws_vpc.pbl.id
+}
+```
+
+- Create a listener for the nginx target group.
+
+```
+#--- create a listener for the load balancer
+resource "aws_lb_listener" "nginx-listner" {
+  load_balancer_arn = aws_lb.ext-alb.arn
+  port              = 443
+  protocol          = "HTTPS"
+  certificate_arn   = aws_acm_certificate_validation.jmn_validation.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.nginx-tgt.arn
+  }
+}
+```
+
+- Create a file called `output.tf` and paste in the code block below to output the DNS and target group name
+
+```
+output "alb_dns_name" {
+  value = aws_lb.ext-alb.dns_name
+}
+
+output "alb_target_group_arn" {
+  value = aws_lb_target_group.nginx-tgt.arn
+}
+```
+
+- In the `alb.tf` file, add the following code to create an internal load balancer.
+
+```
+# ----------------------------
+#Internal Load Balancers for webservers
+#---------------------------------
+resource "aws_lb" "int-alb" {
+  name     = "int-alb"
+  internal = true
+
+  security_groups = [aws_security_group.int-alb-sg.id]
+
+  subnets = [aws_subnet.private[0].id, aws_subnet.private[1].id]
+
+  tags = {
+    Name = "int-alb"
+  }
+
+  ip_address_type    = "ipv4"
+  load_balancer_type = "application"
+}
+```
+
+- Create target group for the wordpress and tooling server to inform the ALB where to route traffic.
+
+```
+# --- target group  for wordpress -------
+resource "aws_lb_target_group" "wordpress-tgt" {
+  health_check {
+    interval            = 10
+    path                = "/healthstatus"
+    protocol            = "HTTPS"
+    timeout             = 5
+    healthy_threshold   = 5
+    unhealthy_threshold = 2
+  }
+
+  name        = "wordpress-tgt"
+  port        = 443
+  protocol    = "HTTPS"
+  target_type = "instance"
+  vpc_id      = aws_vpc.pbl.id
+}
+
+# --- target group for tooling -------
+resource "aws_lb_target_group" "tooling-tgt" {
+  health_check {
+    interval            = 10
+    path                = "/healthstatus"
+    protocol            = "HTTPS"
+    timeout             = 5
+    healthy_threshold   = 5
+    unhealthy_threshold = 2
+  }
+
+  name        = "tooling-tgt"
+  port        = 443
+  protocol    = "HTTPS"
+  target_type = "instance"
+  vpc_id      = aws_vpc.pbl.id
+}
+```
+
+- Create a listener for the target groups.
+
+```
+# For this aspect a single listener was created for the wordpress which is default,
+# A rule was created to route traffic to tooling when the host header changes
+
+resource "aws_lb_listener" "web-listener" {
+  load_balancer_arn = aws_lb.int-alb.arn
+  port              = 443
+  protocol          = "HTTPS"
+  certificate_arn   = aws_acm_certificate_validation.jmn_validation.certificate_arn
+
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.wordpress-tgt.arn
+  }
+}
+
+# # listener rule for tooling target
+
+resource "aws_lb_listener_rule" "tooling-listener" {
+  listener_arn = aws_lb_listener.web-listener.arn
+  priority     = 99
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.tooling-tgt.arn
+  }
+
+  condition {
+    host_header {
+      values = ["tooling.constanet.wip.la"]
+    }
+  }
+}
+```
+
+**Step 9 - Create Autoscaling Group**
+---
+
+- Create a new file called `asg-bastion-nginx.tf`. This will contain the configuration used to create an autoscaling group for the bastion and nginx server.
+
+```
+# Get list of availability zones
+data "aws_availability_zones" "available-bastion" {
+  state = "available"
+}
+
+# creating sns topic for all the auto scaling groups
+resource "aws_sns_topic" "ACS-sns" {
+  name = "Default_CloudWatch_Alarms_Topic"
+}
+
+
+# creating notification for all the auto scaling groups
+resource "aws_autoscaling_notification" "aws_notifications" {
+  group_names = [
+    aws_autoscaling_group.bastion-asg.name,
+    aws_autoscaling_group.nginx-asg.name,
+    aws_autoscaling_group.wordpress-asg.name,
+    aws_autoscaling_group.tooling-asg.name,
+  ]
+  notifications = [
+    "autoscaling:EC2_INSTANCE_LAUNCH",
+    "autoscaling:EC2_INSTANCE_TERMINATE",
+    "autoscaling:EC2_INSTANCE_LAUNCH_ERROR",
+    "autoscaling:EC2_INSTANCE_TERMINATE_ERROR",
+  ]
+
+  topic_arn = aws_sns_topic.ACS-sns.arn
+}
+
+resource "random_shuffle" "az_list" {
+  input = data.aws_availability_zones.available-bastion.names
+}
+
+resource "aws_launch_template" "bastion-launch-template" {
+  name                   = "bastion-launch-template"
+  instance_type          = "t2.micro"
+  image_id               = var.ami
+  vpc_security_group_ids = [aws_security_group.bastion-sg.id]
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ip.id
+  }
+
+  key_name = var.keypair
+
+  placement {
+    availability_zone = "random_shuffle.az_list.result"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "bastion-launch-template"
+    }
+  }
+
+  user_data = filebase64("${path.module}/bastion.sh")
+}
+
+
+# ---- Autoscaling for bastion  hosts
+
+resource "aws_autoscaling_group" "bastion-asg" {
+  name                      = "bastion-asg"
+  max_size                  = 2
+  min_size                  = 2
+  health_check_grace_period = 300
+  health_check_type         = "ELB"
+  desired_capacity          = 2
+
+  # Where you place in your subnet
+  vpc_zone_identifier = [aws_subnet.public[0].id, aws_subnet.public[1].id]
+
+  launch_template {
+    id      = aws_launch_template.bastion-launch-template.id
+    version = "$Latest"
+  }
+  tag {
+    key                 = "Name"
+    value               = "ACS-Bastion"
+    propagate_at_launch = true
+  }
+
+}
+
+resource "aws_launch_template" "nginx-launch-template" {
+  name                   = "nginx-launch-template"
+  instance_type          = "t2.micro"
+  image_id               = var.ami
+  vpc_security_group_ids = [aws_security_group.nginx-sg.id]
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ip.id
+  }
+
+  key_name = var.keypair
+
+  placement {
+    availability_zone = "random_shuffle.az_list.result"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "nginx-launch-template"
+    }
+  }
+
+  user_data = filebase64("${path.module}/nginx.sh")
+}
+
+
+# ------ Autoscalaling group for reverse proxy nginx ---------
+
+resource "aws_autoscaling_group" "nginx-asg" {
+  name                      = "nginx-asg"
+  max_size                  = 2
+  min_size                  = 1
+  health_check_grace_period = 300
+  health_check_type         = "ELB"
+  desired_capacity          = 1
+
+  vpc_zone_identifier = [aws_subnet.public[0].id, aws_subnet.public[1].id]
+
+  launch_template {
+    id      = aws_launch_template.nginx-launch-template.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "ACS-nginx"
+    propagate_at_launch = true
+  }
+}
+
+# attaching autoscaling group of nginx to external load balancer
+resource "aws_autoscaling_attachment" "asg_attachment_nginx" {
+  autoscaling_group_name = aws_autoscaling_group.nginx-asg.id
+  lb_target_group_arn   = aws_lb_target_group.nginx-tgt.arn
+}
+```
+
+- Create `asg-wordpress-tooling.tf` and enter the following codes which would create launch templates and auto scaling groups for both the wordpress and tooling webserver.
+
+```
+# Launch template for wordpress
+resource "aws_launch_template" "wordpress-launch-template" {
+  name                   = "wordpress-launch-template"
+  instance_type          = "t2.micro"
+  image_id               = var.ami
+  vpc_security_group_ids = [aws_security_group.webserver-sg.id]
+
+  provisioner "local-exec" {
+    command = "powershell.exe ${path.module}/wordpress.sh ${aws_efs_access_point.wordpress.id} ${aws_efs_file_system.ACS-efs.id}"
+  }
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ip.id
+  }
+
+  key_name = var.keypair
+
+  placement {
+    availability_zone = "random_shuffle.az_list.result"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "wordpress-launch-template"
+    }
+  }
+
+  user_data = filebase64("${path.module}/wordpress.sh")
+
+}
+
+# ---- Autoscaling for wordpress application
+resource "aws_autoscaling_group" "wordpress-asg" {
+  name                      = "wordpress-asg"
+  max_size                  = 2
+  min_size                  = 1
+  health_check_grace_period = 300
+  health_check_type         = "ELB"
+  desired_capacity          = 2
+
+  # Where you place in your subnet
+  vpc_zone_identifier = [aws_subnet.private[0].id, aws_subnet.private[1].id]
+
+  launch_template {
+    id      = aws_launch_template.wordpress-launch-template.id
+    version = "$Latest"
+  }
+  tag {
+    key                 = "Name"
+    value               = "ACS-wordpress"
+    propagate_at_launch = true
+  }
+
+}
+
+# attaching autoscaling group of wordpress to internal load balancer
+resource "aws_autoscaling_attachment" "asg_attachment_wordpress" {
+  autoscaling_group_name = aws_autoscaling_group.wordpress-asg.id
+  lb_target_group_arn   = aws_lb_target_group.wordpress-tgt.arn
+}
+
+# launch template for tooling
+resource "aws_launch_template" "tooling-launch-template" {
+  name                   = "tooling-launch-template"
+  instance_type          = "t2.micro"
+  image_id               = var.ami
+  vpc_security_group_ids = [aws_security_group.webserver-sg.id]
+
+    provisioner "local-exec" {
+    command = "powershell.exe ${path.module}/tooling.sh ${aws_efs_access_point.tooling.id} ${aws_efs_file_system.ACS-efs.id}"
+  }
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ip.id
+  }
+
+  key_name = var.keypair
+
+  placement {
+    availability_zone = "random_shuffle.az_list.result"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "tooling-launch-template"
+    }
+  }
+
+  user_data = filebase64("${path.module}/tooling.sh")
+}
+
+# ---- Autoscaling for tooling 
+resource "aws_autoscaling_group" "tooling-asg" {
+  name                      = "tooling-asg"
+  max_size                  = 2
+  min_size                  = 1
+  health_check_grace_period = 300
+  health_check_type         = "ELB"
+  desired_capacity          = 2
+
+  # Where you place in your subnet
+  vpc_zone_identifier = [aws_subnet.private[0].id, aws_subnet.private[1].id]
+
+  launch_template {
+    id      = aws_launch_template.tooling-launch-template.id
+    version = "$Latest"
+  }
+  tag {
+    key                 = "Name"
+    value               = "ACS-tooling"
+    propagate_at_launch = true
+  }
+
+}
+
+# attaching autoscaling group of tooling application to internal loadbalancer
+resource "aws_autoscaling_attachment" "asg_attachment_tooling" {
+  autoscaling_group_name = aws_autoscaling_group.tooling-asg.id
+  lb_target_group_arn   = aws_lb_target_group.tooling-tgt.arn
+}
+```
+
+*The provisioner line has a command to dynamically get the EFS mount and access point values when it gets created. The EFS will not be created on the AWS console but by Terraform and the values will be delivered to where variales/placeholders are kept*
+
+**Step 10 - Create Installation Scripts On Servers**
+---
+
+- Create `bastion.sh` file and insert the code below:
+
+```
+#!/bin/bash
+yum install -y mysql
+yum install -y git tmux
+yum install -y ansible
+```
+
+- Create `nginx.sh` file and insert code below:
+
+```
+#!/bin/bash
+yum install -y nginx
+systemctl start nginx
+systemctl enable nginx
+git clone https://github.com/jaymineh/ACS-project-config.git
+mv /ACS-project-config/reverse.conf /etc/nginx/
+mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf-distro
+cd /etc/nginx/
+touch nginx.conf
+sed -n 'w nginx.conf' reverse.conf
+systemctl restart nginx
+rm -rf reverse.conf
+rm -rf /ACS-project-config
+```
+
+- Create `wordpress.sh` and insert the following:
+
+```
+#!/bin/bash
+mkdir /var/www/
+sudo mount -t efs -o tls,accesspoint="$1" "$2":/ /var/www/
+yum install -y httpd 
+systemctl start httpd
+systemctl enable httpd
+yum module reset php -y
+yum module enable php:remi-7.4 -y
+yum install -y php php-common php-mbstring php-opcache php-intl php-xml php-gd php-curl php-mysqlnd php-fpm php-json
+systemctl start php-fpm
+systemctl enable php-fpm
+wget http://wordpress.org/latest.tar.gz
+tar xzvf latest.tar.gz
+rm -rf latest.tar.gz
+cp wordpress/wp-config-sample.php wordpress/wp-config.php
+mkdir /var/www/html/
+cp -R /wordpress/* /var/www/html/
+cd /var/www/html/
+touch healthstatus
+sed -i "s/localhost/tcs-database.cgk2jcnauxqt.us-east-2.rds.amazonaws.com/g" wp-config.php 
+sed -i "s/username_here/TCSadmin/g" wp-config.php 
+sed -i "s/password_here/1234567890/g" wp-config.php 
+sed -i "s/database_name_here/wordpressdb/g" wp-config.php 
+chcon -t httpd_sys_rw_content_t /var/www/html/ -R
+systemctl restart httpd
+```
+
+*In the sudo mount line, $1 & $2 are used as placeholders for the EFS mount points and access points. The values will be gotten when the `provisioner` line in `asg-wordpress-nginx.tf` runs and the placeholder will be replaced with the generated values*
+
+- Create `tooling.sh` and insert the following:
+
+```
+#!/bin/bash
+mkdir /var/www/
+sudo mount -t efs -o tls,accesspoint="$1" "$2":/ /var/www/
+yum install -y httpd 
+systemctl start httpd
+systemctl enable httpd
+yum module reset php -y
+yum module enable php:remi-7.4 -y
+yum install -y php php-common php-mbstring php-opcache php-intl php-xml php-gd php-curl php-mysqlnd php-fpm php-json
+systemctl start php-fpm
+systemctl enable php-fpm
+git clone https://github.com/Tonybesto/tooling.git
+mkdir /var/www/html
+cp -R /tooling/html/*  /var/www/html/
+cd /tooling
+mysql -h rcr-dbmysql.crvnhmpyxtuf.us-east-1.rds.amazonaws.com -u admin -p toolingdb < tooling-db.sql
+cd /var/www/html/
+touch healthstatus
+sed -i "s/$db = mysqli_connect('172.31.32.49', 'webaccess', 'password', 'tooling');/$db = mysqli_connect('tcs-database.cgk2jcnauxqt.us-east-2.rds.amazonaws.com', 'TCSadmin', '1234567890', 'toolingdb');/g" functions.php
+chcon -t httpd_sys_rw_content_t /var/www/html/ -R
+systemctl restart httpd
+```
+
+*In the sudo mount line, $1 & $2 are used as placeholders for the EFS mount points and access points. The values will be gotten when the `provisioner` line in `asg-wordpress-nginx.tf` runs and the placeholder will be replaced with the generated values*
+
